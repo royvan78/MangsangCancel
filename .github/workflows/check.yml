@@ -1,0 +1,46 @@
+name: 망상 오토캠핑 취소자리 알림
+
+on:
+  schedule:
+    # 5분마다 24시간 내내
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 패키지 설치
+        run: pip install requests
+
+      # 중복 알림 방지용 캐시 복원 (이전 실행에서 저장한 sent_log.json)
+      - name: 캐시 복원
+        uses: actions/cache@v4
+        with:
+          path: sent_log.json
+          key: mangsan-sent-log-${{ github.run_id }}
+          restore-keys: |
+            mangsan-sent-log-
+
+      - name: 잔여현황 확인
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT:  ${{ secrets.TG_CHAT }}
+        run: python check.py
+
+      # 실행 후 sent_log.json 캐시 저장
+      - name: 캐시 저장
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: sent_log.json
+          key: mangsan-sent-log-${{ github.run_id }}
