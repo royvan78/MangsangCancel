@@ -1,23 +1,42 @@
 """
 망상 오토캠핑리조트 취소자리 알림
-- 대상: 2026년 7월 전체 (1박 기준으로 각 날짜 체크)
-- 든바다 / 난바다 / 허허바다 예약가능 방 감지
+- 자동 로그인 (PBKDF2+AES128 암호화)
+- 7월 전체 날짜 체크
 - 선호 방 매칭 시 텔레그램 알림
-- 중복 알림 방지: 같은 날짜+같은 방은 1시간 내 재알림 없음
+- 중복 알림 방지 (1시간)
 """
 
-import os
-import re
-import json
-import hashlib
+import os, re, json, base64, binascii, hmac, hashlib
 import requests
 from datetime import date, timedelta, datetime
+from Crypto.Cipher import AES
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Util.Padding import pad
+
+# ── 암호화 설정 (openworks.password.js) ───────────────────────
+PASS_SALT      = "97f2fde29cd4493f199c2f3e9b7df120"
+PASS_IV        = "4c1f89c42e9f06036385e90aadd7389f"
+PASS_PHRASE    = "v4.0"
+PASS_ITERATION = 1000
+
+def op_encrypt(plain_text: str) -> str:
+    salt = binascii.unhexlify(PASS_SALT)
+    iv   = binascii.unhexlify(PASS_IV)
+    key  = PBKDF2(
+        PASS_PHRASE.encode('utf-8'), salt, dkLen=16, count=PASS_ITERATION,
+        prf=lambda p, s: hmac.new(p, s, hashlib.sha1).digest()
+    )
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    ct = cipher.encrypt(pad(plain_text.encode('utf-8'), AES.block_size))
+    return base64.b64encode(ct).decode('utf-8')
 
 # ── 설정 ──────────────────────────────────────────────────────
-BASE_URL = "https://www.campingkorea.or.kr"
-TRRSRT   = "1000"
+BASE_URL  = "https://www.campingkorea.or.kr"
+TRRSRT    = "1000"
 
-# 7월 전체 날짜 (체크인 기준, 1박)
+USER_ID   = os.environ.get("CK_ID", "")
+USER_PW   = os.environ.get("CK_PW", "")  # 평문 비번 → 자동 암호화
+
 TARGET_DATES = [
     (date(2026, 7, d), date(2026, 7, d) + timedelta(days=1))
     for d in range(1, 32)
@@ -29,7 +48,6 @@ CATEGORIES = {
     "hb": {"name": "허허바다", "fcltyCode": "1500", "resveNoCode": "MB"},
 }
 
-# 선호 방 번호 (숫자만, v5.8 기준)
 PREFERRED = {
     "db": {
         "1순위": ["109", "116", "103"],
@@ -45,40 +63,86 @@ PREFERRED = {
     },
 }
 
-TG_TOKEN  = os.environ.get("TG_TOKEN", "")
-TG_CHAT   = os.environ.get("TG_CHAT", "")
-
-# 중복 방지: 이미 알림 보낸 (날짜+카테고리+방코드) 세트를 파일로 저장
-SENT_LOG  = "sent_log.json"
-DEDUP_TTL = 3600  # 1시간 내 같은 방 재알림 없음 (초)
+TG_TOKEN = os.environ.get("TG_TOKEN", "")
+TG_CHAT  = os.environ.get("TG_CHAT", "")
+SENT_LOG = "sent_log.json"
+DEDUP_TTL = 3600
 # ──────────────────────────────────────────────────────────────
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "ko-KR,ko;q=0.9",
     "Origin": BASE_URL,
-    "Referer": f"{BASE_URL}/user/reservation/BD_reservationReq.do",
-    "X-Requested-With": "XMLHttpRequest",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Referer": BASE_URL,
 })
 
 
-def warm_session():
+def login() -> bool:
+    """캠핑코리아 자동 로그인"""
+    # 1. 메인 페이지 먼저 방문 (쿠키 초기화)
+    SESSION.get(f"{BASE_URL}/", timeout=10)
+    SESSION.get(f"{BASE_URL}/login/BD_loginForm.do", timeout=10)
+
+    # 2. 비번 암호화
+    enc_pw = op_encrypt(USER_PW)
+    print(f"  로그인 시도: {USER_ID}")
+
+    # 3. 로그인 POST
+    SESSION.headers.update({
+        "Referer": f"{BASE_URL}/login/BD_loginForm.do",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept": "*/*",
+    })
+    resp = SESSION.post(
+        f"{BASE_URL}/login/ND_loginAction.do",
+        data={
+            "returnUrl": f"{BASE_URL}/index.do",
+            "userId": USER_ID,
+            "userPassword": enc_pw,
+        },
+        timeout=15,
+        allow_redirects=True,
+    )
+
+    # 4. 로그인 성공 여부 확인
+    # 세션 쿠키에 USER_JSESSIONID 있으면 성공
+    cookies = dict(SESSION.cookies)
+    if "USER_JSESSIONID" in cookies:
+        print(f"  ✅ 로그인 성공!")
+        return True
+
+    # 응답 body로도 확인
     try:
-        SESSION.get(f"{BASE_URL}/", timeout=10)
-        SESSION.get(f"{BASE_URL}/user/reservation/BD_reservation.do", timeout=10)
-    except Exception as e:
-        print(f"  워밍업 실패 (계속 진행): {e}")
+        data = resp.json()
+        if data.get("result") == "success" or data.get("loginYn") == "Y":
+            print(f"  ✅ 로그인 성공! (JSON)")
+            return True
+    except Exception:
+        pass
+
+    # 리다이렉트 후 index.do 도달 확인
+    if "index.do" in resp.url or resp.status_code == 200:
+        # 한번 더 확인 - 마이페이지 접근 가능한지
+        my = SESSION.get(f"{BASE_URL}/user/mypage/BD_myPage.do", timeout=10)
+        if "로그인" not in my.text[:500]:
+            print(f"  ✅ 로그인 성공! (마이페이지 확인)")
+            return True
+
+    print(f"  ❌ 로그인 실패 (status={resp.status_code})")
+    print(f"  응답: {resp.text[:200]}")
+    return False
 
 
 def fetch_rooms(cat_key: str, begin_de: str, end_de: str) -> list:
     cat = CATEGORIES[cat_key]
+    SESSION.headers.update({
+        "Referer": f"{BASE_URL}/user/reservation/BD_reservationReq.do",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    })
     url = f"{BASE_URL}/user/reservation/ND_selectChildFcltyList.do"
     payload = {
         "trrsrtCode":   TRRSRT,
@@ -117,7 +181,6 @@ def get_priority(cat_key: str, fclty_code: str):
     return None
 
 
-# ── 중복 방지 로직 ────────────────────────────────────────────
 def load_sent_log() -> dict:
     try:
         with open(SENT_LOG, "r") as f:
@@ -127,51 +190,45 @@ def load_sent_log() -> dict:
 
 
 def save_sent_log(log: dict):
+    cutoff = datetime.now().timestamp() - 86400
+    log = {k: v for k, v in log.items() if v > cutoff}
     with open(SENT_LOG, "w") as f:
         json.dump(log, f)
 
 
-def make_key(date_str: str, cat_key: str, fclty_code: str) -> str:
-    return f"{date_str}_{cat_key}_{fclty_code}"
-
-
 def is_already_sent(log: dict, key: str) -> bool:
     ts = log.get(key)
-    if ts is None:
-        return False
-    return (datetime.now().timestamp() - ts) < DEDUP_TTL
+    return ts is not None and (datetime.now().timestamp() - ts) < DEDUP_TTL
 
 
-def mark_sent(log: dict, key: str):
-    log[key] = datetime.now().timestamp()
-
-
-# ── 텔레그램 ──────────────────────────────────────────────────
 def send_telegram(message: str):
     if not TG_TOKEN or not TG_CHAT:
         print("[텔레그램 미설정]\n", message)
         return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    resp = requests.post(url, json={
-        "chat_id": TG_CHAT,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }, timeout=10)
+    resp = requests.post(
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+        json={"chat_id": TG_CHAT, "text": message, "parse_mode": "HTML",
+              "disable_web_page_preview": True},
+        timeout=10
+    )
     resp.raise_for_status()
-    print(f"  텔레그램 전송 완료 (id={resp.json()['result']['message_id']})")
+    print(f"  텔레그램 전송 완료!")
 
 
-# ── 메인 ──────────────────────────────────────────────────────
 def main():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now_str}] 망상 오토캠핑 잔여현황 확인 시작...")
 
-    warm_session()
-    sent_log = load_sent_log()
+    if not USER_ID or not USER_PW:
+        print("❌ CK_ID / CK_PW 환경변수 없음!")
+        return
 
-    # 날짜별 체크
-    new_alerts = {}   # {date_str: {cat_key: [방dict, ...]}}
+    if not login():
+        print("❌ 로그인 실패로 종료")
+        return
+
+    sent_log = load_sent_log()
+    new_alerts = {}
 
     for begin_dt, end_dt in TARGET_DATES:
         begin_str = begin_dt.strftime("%Y-%m-%d")
@@ -182,70 +239,59 @@ def main():
             rooms = fetch_rooms(cat_key, begin_str, end_str)
             if not rooms:
                 continue
-
-            # 중복 제거: 이미 알림 보낸 방은 제외
-            new_rooms = []
-            for r in rooms:
-                key = make_key(begin_str, cat_key, r["fcltyCode"])
-                if not is_already_sent(sent_log, key):
-                    new_rooms.append(r)
-
+            new_rooms = [
+                r for r in rooms
+                if not is_already_sent(sent_log, f"{begin_str}_{cat_key}_{r['fcltyCode']}")
+            ]
             if new_rooms:
                 day_hits[cat_key] = new_rooms
 
         if day_hits:
             new_alerts[begin_str] = day_hits
-            cats_found = [CATEGORIES[k]["name"] for k in day_hits]
-            print(f"  ✅ {begin_str}: 신규 잔여! {cats_found}")
+            print(f"  ✅ {begin_str}: 신규 잔여! {[CATEGORIES[k]['name'] for k in day_hits]}")
         else:
-            print(f"  - {begin_str}: 없음 (또는 이미 알림됨)")
+            print(f"  - {begin_str}: 없음")
 
     if not new_alerts:
         print("신규 잔여 없음")
         return
 
-    # 텔레그램 메시지 구성
+    # 텔레그램 메시지
     lines = [f"🏕️ <b>망상 오토캠핑 취소자리 발생!</b>  ⏰ {now_str}\n"]
-
     has_preferred_global = False
+
     for date_str, cats in sorted(new_alerts.items()):
-        lines.append(f"━━━━━━━━━━━━━━━━━━")
+        lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append(f"📅 <b>{date_str}</b>")
         for cat_key, rooms in cats.items():
-            cat_name = CATEGORIES[cat_key]["name"]
-            room_parts = []
+            parts = []
             has_preferred = False
             for r in rooms:
                 code = r["fcltyCode"]
                 rank = get_priority(cat_key, code)
                 if rank:
-                    room_parts.append(f"<b>{code}[{rank}]⭐</b>")
+                    parts.append(f"<b>{code}[{rank}]⭐</b>")
                     has_preferred = True
                     has_preferred_global = True
                 else:
-                    room_parts.append(code)
+                    parts.append(code)
             prefix = "★ " if has_preferred else "  "
-            lines.append(f"{prefix}[{cat_name}] {', '.join(room_parts)}")
+            lines.append(f"{prefix}[{CATEGORIES[cat_key]['name']}] {', '.join(parts)}")
 
-    lines.append(f"━━━━━━━━━━━━━━━━━━")
+    lines.append("━━━━━━━━━━━━━━━━━━")
     if has_preferred_global:
         lines.append("⚡ <b>선호 방 포함! 지금 바로 예약하세요!</b>")
     lines.append(f'👉 <a href="{BASE_URL}/user/reservation/BD_reservation.do">예약 페이지</a>')
 
     send_telegram("\n".join(lines))
 
-    # 알림 보낸 방 기록
+    # 알림 기록 저장
     for date_str, cats in new_alerts.items():
         for cat_key, rooms in cats.items():
             for r in rooms:
-                key = make_key(date_str, cat_key, r["fcltyCode"])
-                mark_sent(sent_log, key)
-
-    # 오래된 로그 정리 (24시간 초과)
-    cutoff = datetime.now().timestamp() - 86400
-    sent_log = {k: v for k, v in sent_log.items() if v > cutoff}
+                key = f"{date_str}_{cat_key}_{r['fcltyCode']}"
+                sent_log[key] = datetime.now().timestamp()
     save_sent_log(sent_log)
-
     print(f"완료! {len(new_alerts)}개 날짜 알림 전송")
 
 
