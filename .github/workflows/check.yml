@@ -2,7 +2,6 @@ name: 망상 오토캠핑 취소자리 알림
 
 on:
   schedule:
-    # 5분마다 24시간 내내
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
@@ -20,9 +19,8 @@ jobs:
           python-version: "3.11"
 
       - name: 패키지 설치
-        run: pip install requests
+        run: pip install requests pycryptodome
 
-      # 중복 알림 방지용 캐시 복원 (이전 실행에서 저장한 sent_log.json)
       - name: 캐시 복원
         uses: actions/cache@v4
         with:
@@ -35,9 +33,10 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT:  ${{ secrets.TG_CHAT }}
+          CK_ID:    ${{ secrets.CK_ID }}
+          CK_PW:    ${{ secrets.CK_PW }}
         run: python check.py
 
-      # 실행 후 sent_log.json 캐시 저장
       - name: 캐시 저장
         if: always()
         uses: actions/cache/save@v4
