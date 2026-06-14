@@ -8,10 +8,15 @@
 
 import os, re, json, base64, binascii, hmac, hashlib
 import requests
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
 from Crypto.Cipher import AES
 from Crypto.Protocol.KDF import PBKDF2
 from Crypto.Util.Padding import pad
+
+KST = timezone(timedelta(hours=9))
+
+def now_kst():
+    return datetime.now(KST)
 
 # ── 암호화 설정 (openworks.password.js) ───────────────────────
 PASS_SALT      = "97f2fde29cd4493f199c2f3e9b7df120"
@@ -216,8 +221,8 @@ def send_telegram(message: str):
 
 
 def main():
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now_str}] 망상 오토캠핑 잔여현황 확인 시작...")
+    now_str = now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now_str} KST] 망상 오토캠핑 잔여현황 확인 시작...")
 
     if not USER_ID or not USER_PW:
         print("❌ CK_ID / CK_PW 환경변수 없음!")
@@ -257,7 +262,7 @@ def main():
         return
 
     # 텔레그램 메시지
-    lines = [f"🏕️ <b>망상 오토캠핑 취소자리 발생!</b>  ⏰ {now_str}\n"]
+    lines = [f"🏕️ <b>망상 오토캠핑 취소자리 발생!</b>  ⏰ {now_str} (KST)\n"]
     has_preferred_global = False
 
     for date_str, cats in sorted(new_alerts.items()):
