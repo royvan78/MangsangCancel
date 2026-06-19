@@ -44,8 +44,11 @@ USER_PW   = os.environ.get("CK_PW", "")  # 평문 비번 → 자동 암호화
 
 TARGET_DATES = [
     (date(2026, 7, d), date(2026, 7, d) + timedelta(days=1))
-    for d in range(1, 32)
+    for d in range(16, 32)  # 7/16 ~ 7/31 (사용량 절감)
 ]
+
+# 알림 대상 등급 (이 등급에 해당하는 방만 텔레그램 전송)
+ALERT_RANKS = ("1순위", "2순위")
 
 CATEGORIES = {
     "db": {"name": "든바다",   "fcltyCode": "1300", "resveNoCode": "MA"},
@@ -244,8 +247,17 @@ def main():
             rooms = fetch_rooms(cat_key, begin_str, end_str)
             if not rooms:
                 continue
-            new_rooms = [
+
+            # 1순위/2순위 방만 필터링 (3순위/ALL 등은 알림 제외)
+            priority_rooms = [
                 r for r in rooms
+                if get_priority(cat_key, r["fcltyCode"]) in ALERT_RANKS
+            ]
+            if not priority_rooms:
+                continue
+
+            new_rooms = [
+                r for r in priority_rooms
                 if not is_already_sent(sent_log, f"{begin_str}_{cat_key}_{r['fcltyCode']}")
             ]
             if new_rooms:
