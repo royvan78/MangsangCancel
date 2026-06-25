@@ -191,12 +191,16 @@ def submit_reservation(room: dict, preocpc: dict, begin_de: str, end_de: str):
         "X-Requested-With": "XMLHttpRequest",
     })
 
-    # 선점 응답에서 받은 값 우선 사용, 없으면 조회값 폴백
-    fclty_code   = preocpc.get("fcltyCode",   room["fcltyCode"])
-    fclty_ty     = preocpc.get("fcltyTyCode", room["fcltyTyCode"])
-    preocpc_code = preocpc.get("preocpcFcltyCode", fclty_code)
-    resve_no_cd  = preocpc.get("resveNoCode", room["resveNoCode"])
-    resve_no     = preocpc.get("resveNo", "")
+    # 선점 응답에서 받은 값 우선 사용, null/없으면 조회값 폴백
+    def pick(key, fallback):
+        v = preocpc.get(key)
+        return v if v not in (None, "", "null") else fallback
+
+    fclty_code   = pick("fcltyCode",        room["fcltyCode"])
+    fclty_ty     = pick("fcltyTyCode",      room["fcltyTyCode"])
+    preocpc_code = pick("preocpcFcltyCode", fclty_code)
+    resve_no_cd  = pick("resveNoCode",      room["resveNoCode"])
+    resve_no     = pick("resveNo",          "")
 
     payload = {
         "trrsrtCode":        TRRSRT,
