@@ -284,27 +284,28 @@ def run_test():
     begin_str = begin_dt.strftime("%Y-%m-%d")
     end_str   = end_dt.strftime("%Y-%m-%d")
 
-    # 방이 속한 카테고리 추정 (DB/NF/HB 접두사)
-    prefix = re.sub(r"\d", "", TEST_ROOM).upper()
-    cat_key = {"DB": "db", "NF": "nb", "HB": "hb"}.get(prefix)
-    if not cat_key:
-        send_telegram(f"🧪 테스트 실패: 방 접두사 인식 불가 ({TEST_ROOM})")
-        return
-
-    # 조회해서 해당 방 찾기
-    rooms = fetch_rooms(cat_key, begin_str, end_str)
-    room = next((r for r in rooms if re.sub(r"\D", "", r["fcltyCode"]) == re.sub(r"\D", "", TEST_ROOM)), None)
+    target_num = re.sub(r"\D", "", TEST_ROOM)  # 숫자만 (접두사 NG/NF 무관)
 
     report = [f"🧪 <b>예약 테스트</b>  ⏰ {now_str}",
-              f"📅 {begin_str}~{end_str} / 🏕️ {TEST_ROOM} ({CATEGORIES[cat_key]['name']})", ""]
+              f"📅 {begin_str}~{end_str} / 🏕️ {TEST_ROOM} (숫자={target_num})", ""]
+
+    # 3개 카테고리 전부 조회해서 숫자로 방 찾기 (접두사 그때그때 바뀜)
+    room = None
+    cat_key = None
+    for ck in CATEGORIES:
+        rooms = fetch_rooms(ck, begin_str, end_str)
+        found = next((r for r in rooms if re.sub(r"\D", "", r["fcltyCode"]) == target_num), None)
+        if found:
+            room = found
+            cat_key = ck
+            break
 
     if not room:
-        avail = ", ".join(r["fcltyCode"] for r in rooms) or "(없음)"
-        report.append(f"❌ 조회 결과 해당 방 없음.\n예약가능: {avail}")
+        report.append("❌ 3개 카테고리에서 해당 번호 방 못 찾음 (예약가능 상태 아님)")
         send_telegram("\n".join(report))
         return
 
-    report.append(f"1️⃣ 방 조회 OK: {room['fcltyCode']} (ty={room['fcltyTyCode']})")
+    report.append(f"1️⃣ 방 조회 OK: {room['fcltyCode']} ({CATEGORIES[cat_key]['name']}, ty={room['fcltyTyCode']})")
 
     # 선점
     preocpc = preoccupy(room, begin_str, end_str)
