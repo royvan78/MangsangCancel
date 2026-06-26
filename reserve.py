@@ -63,7 +63,7 @@ TARGET_ROOMS = {
            "112", "115", "119",        # 2순위
            "121", "123", "120", "122"], # 3순위
     "nb": ["105", "108", "112", "104"], # 1순위
-    "hb": ["104"],                      # 허허바다 104호만
+    "hb": ["104", "105", "107", "106"],  # 허허바다 1순위 (104>105>107>106)
 }
 
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
@@ -355,55 +355,97 @@ def main():
 
     done = load_done()
 
-    for begin_dt, end_dt in TARGET_DATES:
+    # 이미 예약한 "사용 중인 날짜" 집합 (체크인~체크아웃 전날까지)
+    # done 기록의 각 항목은 begin/nights 정보를 가짐
+    booked_nights = set()  # "2026-07-23" 같은 숙박일(체크인 날)
+    for v in done.values():
+        b = v.get("begin")
+        n = v.get("nights", 1)
+        if b:
+            bd = datetime.strptime(b, "%Y-%m-%d").date()
+            for i in range(n):
+                booked_nights.add((bd + timedelta(days=i)).strftime("%Y-%m-%d"))
+
+    success_count = 0
+
+    # 각 체크인 후보 날짜에 대해 3박→2박→1박 시도
+    for begin_dt, _ in TARGET_DATES:
         begin_str = begin_dt.strftime("%Y-%m-%d")
-        end_str   = end_dt.strftime("%Y-%m-%d")
 
-        for cat_key, cat in CATEGORIES.items():
-            rooms = fetch_rooms(cat_key, begin_str, end_str)
-            targets = [r for r in rooms if is_target_room(cat_key, r["fcltyCode"])]
-            if not targets:
-                continue
+        # 이 날짜가 이미 예약된 숙박일이면 건너뜀
+        if begin_str in booked_nights:
+            continue
 
-            for room in targets:
-                done_key = f"{begin_str}_{room['fcltyCode']}"
-                if done_key in done:
-                    print(f"    이미 예약됨: {done_key} → skip")
+        # 이미 예약된 날짜를 침범하지 않는 최대 박수 계산 (상한 3박)
+        max_nights = 0
+        for n in range(1, 4):  # 1,2,3박
+            night_day = (begin_dt + timedelta(days=n-1)).strftime("%Y-%m-%d")
+            # n박이면 begin_dt부터 n일간 숙박 → 각 숙박일이 비어있어야 함
+            if night_day in booked_nights:
+                break
+            # 체크아웃일이 8/1 넘어가도 되지만 숙박일 범위만 보면 됨
+            max_nights = n
+
+        if max_nights == 0:
+            continue
+
+        booked_this_date = False
+        # 긴 박수부터 시도
+        for nights in range(max_nights, 0, -1):
+            if booked_this_date:
+                break
+            end_dt2 = begin_dt + timedelta(days=nights)
+            end_str = end_dt2.strftime("%Y-%m-%d")
+
+            for cat_key, cat in CATEGORIES.items():
+                rooms = fetch_rooms(cat_key, begin_str, end_str)
+                targets = [r for r in rooms if is_target_room(cat_key, r["fcltyCode"])]
+                if not targets:
                     continue
 
-                print(f"  🎯 타겟 발견: {begin_str} [{cat['name']}] {room['fcltyCode']}")
+                for room in targets:
+                    print(f"  🎯 타겟: {begin_str}~{end_str}({nights}박) [{cat['name']}] {room['fcltyCode']}")
 
-                # 1. 선점
-                preocpc = preoccupy(room, begin_str, end_str)
-                if not preocpc:
-                    print(f"    선점 실패 (이미 선점됨/취소중 아님) → 다음 기회에")
-                    continue
+                    preocpc = preoccupy(room, begin_str, end_str)
+                    if not preocpc:
+                        print(f"    선점 실패 → 다음")
+                        continue
 
-                # 2. 예약정보 제출
-                ok, resp_text, _payload = submit_reservation(room, preocpc, begin_str, end_str)
+                    ok, resp_text, _payload = submit_reservation(room, preocpc, begin_str, end_str)
 
-                if ok:
-                    done[done_key] = {
-                        "date": begin_str, "room": room["fcltyCode"],
-                        "cat": cat["name"], "at": now_str,
-                    }
-                    save_done(done)
-                    msg = (
-                        "🎉🎉 <b>망상 예약 성공!!</b> 🎉🎉\n\n"
-                        f"📅 {begin_str} ~ {end_str}\n"
-                        f"🏕️ {cat['name']} <b>{room['fcltyCode']}</b>\n"
-                        f"👤 {USER_ID}\n"
-                        f"⏰ {now_str} (KST)\n\n"
-                        f"👉 <a href=\"{BASE_URL}/user/mypage/BD_myReservationList.do\">예약 확인</a>"
-                    )
-                    send_telegram(msg)
-                    print(f"  ✅✅ 예약 성공! {done_key}")
-                    return  # 하나 성공하면 종료
-                else:
-                    print(f"    ❌ 예약 거부 (취소중 추정): {resp_text[:100]}")
-                    # 취소중이면 아직 안 풀린 것 → 다음 트리거에 재시도
+                    if ok:
+                        key = f"{begin_str}_{nights}박_{room['fcltyCode']}"
+                        done[key] = {
+                            "begin": begin_str, "end": end_str, "nights": nights,
+                            "room": room["fcltyCode"], "cat": cat["name"], "at": now_str,
+                        }
+                        save_done(done)
+                        # 사용 날짜 추가 (이후 날짜 침범 방지)
+                        for i in range(nights):
+                            booked_nights.add((begin_dt + timedelta(days=i)).strftime("%Y-%m-%d"))
+                        success_count += 1
+                        booked_this_date = True
+                        msg = (
+                            "🎉🎉 <b>망상 예약 성공!!</b> 🎉🎉\n\n"
+                            f"📅 {begin_str} ~ {end_str} (<b>{nights}박</b>)\n"
+                            f"🏕️ {cat['name']} <b>{room['fcltyCode']}</b>\n"
+                            f"👤 {USER_ID}\n"
+                            f"⏰ {now_str} (KST)\n\n"
+                            f"👉 <a href=\"{BASE_URL}/user/mypage/BD_myReservationList.do\">예약 확인</a>"
+                        )
+                        send_telegram(msg)
+                        print(f"  ✅✅ 예약 성공! {key}")
+                        break  # 이 카테고리 방 루프 종료
+                    else:
+                        print(f"    ❌ 거부: {resp_text[:80]}")
 
-    print("이번 회차 예약 성공 없음 (재시도 대기)")
+                if booked_this_date:
+                    break  # 카테고리 루프 종료
+
+    if success_count:
+        print(f"완료! 이번 회차 {success_count}건 예약 성공")
+    else:
+        print("이번 회차 예약 성공 없음 (재시도 대기)")
 
 
 if __name__ == "__main__":
