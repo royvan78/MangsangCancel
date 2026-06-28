@@ -24,7 +24,7 @@ def op_encrypt(p):
     return base64.b64encode(c.encrypt(pad(p.encode(),AES.block_size))).decode()
 
 BASE_URL="https://www.campingkorea.or.kr"; TRRSRT="1000"
-USER_ID=os.environ.get("CK_ID",""); USER_PW=os.environ.get("CK_PW","")
+USER_ID=os.environ.get("CK_ID_1","") or os.environ.get("CK_ID",""); USER_PW=os.environ.get("CK_PW","")
 
 # 스캔 범위 (체크인 기준, 1박)
 START = date(2026, 6, 26)
