@@ -1,11 +1,10 @@
 """
-망상 오토캠핑리조트 자동 예약
-- 타겟 날짜(7/22 이후)에 타겟 방 발견 시 → 선점 → 예약정보 제출 → 예약 완료
-- 취소중(검은색) 상태는 선점은 되나 최종 예약 거부됨 → 응답 검증으로 구분
-- cron-job.org가 5분마다 트리거 → 2시간 동안 자연스럽게 재시도
-- 예약 성공 시 텔레그램 알림 + 중복 예약 방지(성공 기록)
-
-⚠️ 실제 예약을 수행하는 스크립트입니다. 모니터링용 check.py와 별도.
+망상 오토캠핑리조트 자동 예약 (멀티계정 + 날짜별 플랜)
+- 날짜마다 (ID 우선순위, 방 등급 우선순위)를 PLAN에 정의
+- 한 실행에서 각 날짜를 ID 우선순위 순으로 순차 로그인하며 시도
+- 방 등급 우선순위대로 선점→예약, 연박은 체크인 날짜 기준 3박→2박→1박
+- 이미 잡은 날(계정별 SKIP + 자동기록)은 숙박일 기준 침범 안 함
+- 캡차 불필요(순수 API 경로)
 """
 
 import os, re, json, base64, binascii, hmac, hashlib
@@ -16,437 +15,368 @@ from Crypto.Protocol.KDF import PBKDF2
 from Crypto.Util.Padding import pad
 
 KST = timezone(timedelta(hours=9))
-def now_kst():
-    return datetime.now(KST)
+def now_kst(): return datetime.now(KST)
 
 # ── 암호화 ────────────────────────────────────────────────────
-PASS_SALT      = "97f2fde29cd4493f199c2f3e9b7df120"
-PASS_IV        = "4c1f89c42e9f06036385e90aadd7389f"
-PASS_PHRASE    = "v4.0"
-PASS_ITERATION = 1000
+PASS_SALT="97f2fde29cd4493f199c2f3e9b7df120"; PASS_IV="4c1f89c42e9f06036385e90aadd7389f"
+PASS_PHRASE="v4.0"; PASS_ITERATION=1000
+def op_encrypt(p):
+    key=PBKDF2(PASS_PHRASE.encode(),binascii.unhexlify(PASS_SALT),dkLen=16,count=PASS_ITERATION,
+               prf=lambda a,b:hmac.new(a,b,hashlib.sha1).digest())
+    c=AES.new(key,AES.MODE_CBC,binascii.unhexlify(PASS_IV))
+    return base64.b64encode(c.encrypt(pad(p.encode(),AES.block_size))).decode()
 
-def op_encrypt(plain_text: str) -> str:
-    salt = binascii.unhexlify(PASS_SALT)
-    iv   = binascii.unhexlify(PASS_IV)
-    key  = PBKDF2(PASS_PHRASE.encode(), salt, dkLen=16, count=PASS_ITERATION,
-                  prf=lambda p, s: hmac.new(p, s, hashlib.sha1).digest())
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    ct = cipher.encrypt(pad(plain_text.encode(), AES.block_size))
-    return base64.b64encode(ct).decode()
+# ── 기본 설정 ─────────────────────────────────────────────────
+BASE_URL="https://www.campingkorea.or.kr"; TRRSRT="1000"
+EMGNC_CTTPC="01074607811"   # 비상연락처
+RSVCTM_AREA="1001"          # 거주지역: 서울특별시
 
-# ── 설정 ──────────────────────────────────────────────────────
-BASE_URL = "https://www.campingkorea.or.kr"
-TRRSRT   = "1000"
-
-USER_ID  = os.environ.get("CK_ID", "")   # 예약 계정 (apfldidy)
-USER_PW  = os.environ.get("CK_PW", "")
-
-# 예약정보 입력 필드 (BD_reservationInfo.do)
-EMGNC_CTTPC = "01074607811"   # 비상연락처
-RSVCTM_AREA = "1001"          # 거주지역: 서울특별시
-
-# 타겟 날짜: 7/22 이후 (22 포함) ~ 7/31, 1박
-TARGET_DATES = [
-    (date(2026, 7, d), date(2026, 7, d) + timedelta(days=1))
-    for d in range(22, 32)
-]
+# 계정 3개 (PW 공통)
+ACCOUNTS = {
+    "#1": os.environ.get("CK_ID_1",""),
+    "#2": os.environ.get("CK_ID_2",""),
+    "#3": os.environ.get("CK_ID_3",""),
+}
+COMMON_PW = os.environ.get("CK_PW","")
 
 CATEGORIES = {
-    "db": {"name": "든바다",   "fcltyCode": "1300", "resveNoCode": "MA"},
-    "nb": {"name": "난바다",   "fcltyCode": "1400", "resveNoCode": "MB"},
-    "hb": {"name": "허허바다", "fcltyCode": "1500", "resveNoCode": "MB"},
+    "db": {"name":"든바다",   "fcltyCode":"1300", "resveNoCode":"MA"},
+    "nb": {"name":"난바다",   "fcltyCode":"1400", "resveNoCode":"MB"},
+    "hb": {"name":"허허바다", "fcltyCode":"1500", "resveNoCode":"MB"},
 }
 
-# 자동 예약 타겟 방 (숫자만)
-TARGET_ROOMS = {
-    "db": ["109", "116", "103",        # 1순위
-           "112", "115", "119",        # 2순위
-           "121", "123", "120", "122"], # 3순위
-    "nb": ["105", "108", "112", "104"], # 1순위
-    "hb": ["104", "105", "107", "106"],  # 허허바다 1순위 (104>105>107>106)
+# 방 등급 정의: 등급명 -> (카테고리, 방번호 우선순위)
+GRADE = {
+    "든1":   ("db", ["109","116","103"]),
+    "든2":   ("db", ["112","115","119"]),
+    "든3":   ("db", ["121","123","120","122"]),
+    "난1":   ("nb", ["105","108","112","104"]),
+    "난2":   ("nb", ["107","111","103"]),
+    "허1":   ("hb", ["104","105","107","106"]),
+    "허104": ("hb", ["104"]),
+    "난105": ("nb", ["105"]),
 }
 
-TG_TOKEN = os.environ.get("TG_TOKEN", "")
-TG_CHAT  = os.environ.get("TG_CHAT", "")
+# 날짜별 플랜: 체크인날짜 -> (ID우선순위, 방등급 우선순위)
+PLAN = {
+    "2026-07-22": (["#1"],           ["든1","든2","허104"]),
+    "2026-07-23": (["#2","#1"],      ["든1","든2","허104"]),
+    "2026-07-24": (["#2"],           ["든1","든2","허104"]),
+    "2026-07-25": (["#3","#2"],      ["든1","든2","허104","난105"]),
+    "2026-07-26": (["#3","#2"],      ["든1","든2","허104","난105"]),
+    "2026-07-27": (["#3","#2","#1"], ["든1","든2","든3","난1","난2","허1"]),
+    "2026-07-28": (["#3","#2"],      ["든1","든2","허104","난105"]),
+    "2026-07-29": (["#3","#2"],      ["든1","든2","허104","난105"]),
+    "2026-07-30": (["#3","#2"],      ["든1","든2","허104","난105"]),
+    "2026-07-31": (["#3","#2"],      ["든1","든2","허104","난105"]),
+}
 
-# 예약 성공 기록 (한 번 성공하면 다시 시도 안 함)
-DONE_LOG = "reserved_log.json"
+# 계정별 "이미 확보 / 건드리지 말 날짜" (숙박일 기준, 체크아웃 제외)
+# 별칭(#1/#2/#3) 기준으로 관리
+SKIP_DATES_BY_ACCT = {
+    "#1": ["2026-07-19","2026-07-20","2026-07-21",   # 19~22 든121
+           "2026-07-25","2026-07-26",                # 25~27 든121
+           "2026-07-28","2026-07-29","2026-07-30"],  # 28~31 난112
+    "#2": ["2026-07-22"],                            # 22~23 든121
+    "#3": ["2026-07-23","2026-07-24"],               # 23~25 난108
+}
 
-# ── 테스트 모드 ───────────────────────────────────────────────
-# TEST_DATE(예: 2026-07-07) + TEST_ROOM(예: NF106) 지정 시
-# 해당 방으로만 선점→예약 시도하고 모든 응답 원문을 텔레그램 전송
-TEST_DATE   = os.environ.get("TEST_DATE", "").strip()
-TEST_ROOM   = os.environ.get("TEST_ROOM", "").strip()
-TEST_NIGHTS = int(os.environ.get("TEST_NIGHTS", "1"))
+TG_TOKEN=os.environ.get("TG_TOKEN",""); TG_CHAT=os.environ.get("TG_CHAT","")
+DONE_LOG="reserved_log.json"
 
-LAST_PREOCPC_RAW = ""  # 선점 실패 응답 보관(디버그용)
+# 테스트 모드 (단일계정)
+TEST_DATE=os.environ.get("TEST_DATE","").strip()
+TEST_ROOM=os.environ.get("TEST_ROOM","").strip()
+TEST_NIGHTS=int(os.environ.get("TEST_NIGHTS","1"))
+TEST_ACCT=os.environ.get("TEST_ACCT","#1").strip()
+
+LAST_PREOCPC_RAW=""
 # ──────────────────────────────────────────────────────────────
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9",
-    "Origin": BASE_URL,
-    "Referer": BASE_URL,
-})
-
-
-def login() -> bool:
-    SESSION.get(f"{BASE_URL}/", timeout=10)
-    SESSION.get(f"{BASE_URL}/login/BD_loginForm.do", timeout=10)
-    enc_pw = op_encrypt(USER_PW)
-    SESSION.headers.update({
-        "Referer": f"{BASE_URL}/login/BD_loginForm.do",
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Accept": "*/*",
+def new_session():
+    s=requests.Session()
+    s.headers.update({
+        "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language":"ko-KR,ko;q=0.9","Origin":BASE_URL,"Referer":BASE_URL,
     })
-    resp = SESSION.post(
-        f"{BASE_URL}/login/ND_loginAction.do",
-        data={"returnUrl": f"{BASE_URL}/index.do", "userId": USER_ID, "userPassword": enc_pw},
-        timeout=15, allow_redirects=True,
-    )
-    if "USER_JSESSIONID" in dict(SESSION.cookies):
-        print(f"  ✅ 로그인 성공: {USER_ID}")
+    return s
+
+
+def login(session, user_id) -> bool:
+    session.get(f"{BASE_URL}/",timeout=10)
+    session.get(f"{BASE_URL}/login/BD_loginForm.do",timeout=10)
+    session.headers.update({"Referer":f"{BASE_URL}/login/BD_loginForm.do",
+        "X-Requested-With":"XMLHttpRequest","Content-Type":"application/x-www-form-urlencoded; charset=UTF-8","Accept":"*/*"})
+    resp=session.post(f"{BASE_URL}/login/ND_loginAction.do",
+        data={"returnUrl":f"{BASE_URL}/index.do","userId":user_id,"userPassword":op_encrypt(COMMON_PW)},
+        timeout=15,allow_redirects=True)
+    if "USER_JSESSIONID" in dict(session.cookies):
         return True
-    print(f"  ❌ 로그인 실패: {resp.text[:200]}")
+    print(f"    ❌ 로그인 실패({user_id}): {resp.text[:150]}")
     return False
 
 
-def fetch_rooms(cat_key: str, begin_de: str, end_de: str) -> list:
-    """예약가능(resveAt=Y) 방 목록 조회"""
-    cat = CATEGORIES[cat_key]
-    SESSION.headers.update({
-        "Referer": f"{BASE_URL}/user/reservation/BD_reservationReq.do",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    })
+def fetch_rooms(session, cat_key, begin_de, end_de) -> list:
+    cat=CATEGORIES[cat_key]
+    session.headers.update({"Referer":f"{BASE_URL}/user/reservation/BD_reservationReq.do",
+        "Accept":"application/json, text/javascript, */*; q=0.01","X-Requested-With":"XMLHttpRequest",
+        "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8"})
     try:
-        resp = SESSION.post(
-            f"{BASE_URL}/user/reservation/ND_selectChildFcltyList.do",
-            data={"trrsrtCode": TRRSRT, "fcltyCode": cat["fcltyCode"],
-                  "resveNoCode": cat["resveNoCode"], "resveBeginDe": begin_de,
-                  "resveEndDe": end_de},
-            timeout=10)
-        data = resp.json()
+        resp=session.post(f"{BASE_URL}/user/reservation/ND_selectChildFcltyList.do",
+            data={"trrsrtCode":TRRSRT,"fcltyCode":cat["fcltyCode"],"resveNoCode":cat["resveNoCode"],
+                  "resveBeginDe":begin_de,"resveEndDe":end_de},timeout=10)
+        data=resp.json()
     except Exception as e:
-        print(f"    [{cat['name']}] 조회 오류: {e}")
         return []
-
-    if not data.get("result"):
-        return []
-
-    rooms = []
-    for f in data.get("value", {}).get("childFcltyList", []):
-        if f.get("resveAt") == "Y":
-            rooms.append({
-                "fcltyCode":   f["fcltyCode"],
-                "fcltyTyCode": f.get("fcltyTyCode", ""),
-                "resveNoCode": cat["resveNoCode"],
-            })
+    if not data.get("result"): return []
+    rooms=[]
+    for f in data.get("value",{}).get("childFcltyList",[]):
+        if f.get("resveAt")=="Y":
+            rooms.append({"fcltyCode":f["fcltyCode"],"fcltyTyCode":f.get("fcltyTyCode",""),
+                          "resveNoCode":cat["resveNoCode"]})
     return rooms
 
 
-def is_target_room(cat_key: str, fclty_code: str) -> bool:
-    num = re.sub(r"\D", "", fclty_code)
-    return num in TARGET_ROOMS.get(cat_key, [])
-
-
-def preoccupy(room: dict, begin_de: str, end_de: str):
-    """선점 시도 → 성공 시 선점 데이터(dict) 반환, 실패 시 None"""
-    SESSION.headers.update({
-        "Referer": f"{BASE_URL}/user/reservation/BD_reservationReq.do",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-    try:
-        resp = SESSION.post(
-            f"{BASE_URL}/user/reservation/ND_insertPreocpc.do",
-            data={"trrsrtCode": TRRSRT, "fcltyCode": room["fcltyCode"],
-                  "resveNoCode": room["resveNoCode"], "resveBeginDe": begin_de,
-                  "resveEndDe": end_de},
-            timeout=10)
-        data = resp.json()
-    except Exception as e:
-        print(f"    선점 오류: {e}")
-        return None
-
-    if data.get("preocpcTf") is True:
-        print(f"    ★ 선점 성공: {room['fcltyCode']} (resveNo={data.get('resveNo')})")
-        return data
-    # 디버그용: 실패 응답도 전역에 저장
+def preoccupy(session, room, begin_de, end_de):
     global LAST_PREOCPC_RAW
-    LAST_PREOCPC_RAW = json.dumps(data, ensure_ascii=False)[:400]
+    session.headers.update({"Referer":f"{BASE_URL}/user/reservation/BD_reservationReq.do",
+        "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept":"application/json, text/javascript, */*; q=0.01","X-Requested-With":"XMLHttpRequest"})
+    try:
+        resp=session.post(f"{BASE_URL}/user/reservation/ND_insertPreocpc.do",
+            data={"trrsrtCode":TRRSRT,"fcltyCode":room["fcltyCode"],"resveNoCode":room["resveNoCode"],
+                  "resveBeginDe":begin_de,"resveEndDe":end_de},timeout=10)
+        data=resp.json()
+    except Exception as e:
+        print(f"    선점 오류: {e}"); return None
+    if data.get("preocpcTf") is True:
+        return data
+    LAST_PREOCPC_RAW=json.dumps(data,ensure_ascii=False)[:300]
     return None
 
 
-def submit_reservation(room: dict, preocpc: dict, begin_de: str, end_de: str):
-    """예약정보 제출 (ND_insertresve.do) → (성공여부, 응답텍스트)"""
-    SESSION.headers.update({
-        "Referer": f"{BASE_URL}/user/reservation/BD_reservationInfo.do",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-
-    # 선점 응답에서 받은 값 우선 사용, null/없으면 조회값 폴백
-    def pick(key, fallback):
-        v = preocpc.get(key)
-        return v if v not in (None, "", "null") else fallback
-
-    fclty_code   = pick("fcltyCode",        room["fcltyCode"])
-    fclty_ty     = pick("fcltyTyCode",      room["fcltyTyCode"])
-    preocpc_code = pick("preocpcFcltyCode", fclty_code)
-    resve_no_cd  = pick("resveNoCode",      room["resveNoCode"])
-    resve_no     = pick("resveNo",          "")
-
-    payload = {
-        "trrsrtCode":        TRRSRT,
-        "fcltyCode":         fclty_code,
-        "fcltyTyCode":       fclty_ty,
-        "preocpcFcltyCode":  preocpc_code,
-        "resveNoCode":       resve_no_cd,
-        "resveBeginDe":      begin_de,
-        "resveEndDe":        end_de,
-        "resveNo":           resve_no,
-        "registerId":        USER_ID,
-        "encptEmgncCttpc":   EMGNC_CTTPC,
-        "rsvctmArea":        RSVCTM_AREA,
-        "dspsnFcltyUseAt":   "N",
+def submit_reservation(session, user_id, room, preocpc, begin_de, end_de):
+    session.headers.update({"Referer":f"{BASE_URL}/user/reservation/BD_reservationInfo.do",
+        "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept":"application/json, text/javascript, */*; q=0.01","X-Requested-With":"XMLHttpRequest"})
+    def pick(k,fb):
+        v=preocpc.get(k); return v if v not in (None,"","null") else fb
+    payload={
+        "trrsrtCode":TRRSRT,
+        "fcltyCode":pick("fcltyCode",room["fcltyCode"]),
+        "fcltyTyCode":pick("fcltyTyCode",room["fcltyTyCode"]),
+        "preocpcFcltyCode":pick("preocpcFcltyCode",pick("fcltyCode",room["fcltyCode"])),
+        "resveNoCode":pick("resveNoCode",room["resveNoCode"]),
+        "resveBeginDe":begin_de,"resveEndDe":end_de,
+        "resveNo":pick("resveNo",""),
+        "registerId":user_id,
+        "encptEmgncCttpc":EMGNC_CTTPC,"rsvctmArea":RSVCTM_AREA,"dspsnFcltyUseAt":"N",
     }
-    # entrceDelayCode는 선점 응답에 있으면 포함
     if preocpc.get("entrceDelayCode"):
-        payload["entrceDelayCode"] = preocpc["entrceDelayCode"]
-
+        payload["entrceDelayCode"]=preocpc["entrceDelayCode"]
     try:
-        resp = SESSION.post(
-            f"{BASE_URL}/user/reservation/ND_insertresve.do",
-            data=payload, timeout=15)
-        text = resp.text.strip()
+        resp=session.post(f"{BASE_URL}/user/reservation/ND_insertresve.do",data=payload,timeout=15)
+        text=resp.text.strip()
     except Exception as e:
-        return False, f"제출 오류: {e}", payload
-
-    # 성공/실패 판정
-    fail_words = ["불가능", "다시 예약", "예약가능시설로 변경", "실패", "오류",
-                  "문구", "captcha", "캡차", "캡챠", "방지"]
+        return False,f"제출오류:{e}",payload
+    fail_words=["불가능","다시 예약","예약가능시설로 변경","실패","오류","문구","captcha","캡차","캡챠","방지","존재"]
     if any(w in text for w in fail_words):
-        return False, text[:400], payload
-
+        return False,text[:300],payload
     try:
-        data = json.loads(text)
-        if data.get("result") in (True, "true", "Y", "success") or data.get("resveNo"):
-            return True, text[:400], payload
-        if data.get("result") in (False, "false", "N"):
-            return False, text[:400], payload
+        data=json.loads(text)
+        if data.get("result") in (True,"true","Y","success") or data.get("resveNo"):
+            return True,text[:300],payload
+        if data.get("result") in (False,"false","N"):
+            return False,text[:300],payload
     except Exception:
         pass
+    return True,text[:300],payload
 
-    return True, text[:400], payload
+
+def num_of(code): return re.sub(r"\D","",code)
 
 
-def load_done() -> dict:
+def load_done():
     try:
-        with open(DONE_LOG) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        with open(DONE_LOG) as f: return json.load(f)
+    except Exception: return {}
+
+def save_done(log):
+    cutoff=now_kst().timestamp()-30*86400
+    log={k:v for k,v in log.items() if v.get("ts",9e18)>cutoff}
+    with open(DONE_LOG,"w") as f: json.dump(log,f,ensure_ascii=False)
 
 
-def save_done(log: dict):
-    with open(DONE_LOG, "w") as f:
-        json.dump(log, f, ensure_ascii=False)
-
-
-def send_telegram(message: str):
+def send_telegram(msg):
     if not TG_TOKEN or not TG_CHAT:
-        print("[텔레그램 미설정]\n", message)
-        return
+        print("[텔레그램 미설정]\n",msg); return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": message, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id":TG_CHAT,"text":msg,"parse_mode":"HTML","disable_web_page_preview":True},
             timeout=10).raise_for_status()
         print("  텔레그램 전송 완료!")
     except Exception as e:
         print(f"  텔레그램 전송 실패: {e}")
 
 
-def run_test():
-    """테스트: TEST_ROOM 한 방으로 선점→예약 시도, 모든 응답 텔레그램 전송"""
-    now_str = now_kst().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now_str} KST] 🧪 테스트 모드: {TEST_DATE} {TEST_ROOM} ({TEST_NIGHTS}박)")
+# 계정별 회피 숙박일 집합 만들기 (수동 SKIP + 자동기록)
+def booked_set_for(acct, done):
+    s=set(SKIP_DATES_BY_ACCT.get(acct,[]))
+    for v in done.values():
+        if v.get("acct")==acct and v.get("begin"):
+            bd=datetime.strptime(v["begin"],"%Y-%m-%d").date()
+            for i in range(v.get("nights",1)):
+                s.add((bd+timedelta(days=i)).strftime("%Y-%m-%d"))
+    return s
 
-    if not login():
-        send_telegram("🧪 테스트 실패: 로그인 안 됨")
-        return
 
-    begin_dt = datetime.strptime(TEST_DATE, "%Y-%m-%d").date()
-    end_dt   = begin_dt + timedelta(days=TEST_NIGHTS)
-    begin_str = begin_dt.strftime("%Y-%m-%d")
-    end_str   = end_dt.strftime("%Y-%m-%d")
+def try_one_account_date(session, acct, user_id, begin_str, grades, done):
+    """특정 계정·날짜에서 방등급 우선순위 + 3박→2박→1박 시도.
+    성공 시 (nights, room, cat_key) 반환, 실패 시 None"""
+    begin_dt=datetime.strptime(begin_str,"%Y-%m-%d").date()
+    booked=booked_set_for(acct,done)
 
-    target_num = re.sub(r"\D", "", TEST_ROOM)  # 숫자만 (접두사 NG/NF 무관)
+    if begin_str in booked:
+        return None
 
-    report = [f"🧪 <b>예약 테스트</b>  ⏰ {now_str}",
-              f"📅 {begin_str}~{end_str} / 🏕️ {TEST_ROOM} (숫자={target_num})", ""]
+    # 이 계정이 침범하면 안 되는 날짜 고려해 최대 박수 계산 (상한 3박)
+    max_nights=0
+    for n in range(1,4):
+        night_day=(begin_dt+timedelta(days=n-1)).strftime("%Y-%m-%d")
+        if night_day in booked: break
+        max_nights=n
+    if max_nights==0:
+        return None
 
-    # 3개 카테고리 전부 조회해서 숫자로 방 찾기 (접두사 그때그때 바뀜)
-    room = None
-    cat_key = None
-    for ck in CATEGORIES:
-        rooms = fetch_rooms(ck, begin_str, end_str)
-        found = next((r for r in rooms if re.sub(r"\D", "", r["fcltyCode"]) == target_num), None)
-        if found:
-            room = found
-            cat_key = ck
-            break
+    # 긴 박수 우선
+    for nights in range(max_nights,0,-1):
+        end_str=(begin_dt+timedelta(days=nights)).strftime("%Y-%m-%d")
+        # 방 등급 우선순위대로
+        for g in grades:
+            cat_key, nums = GRADE[g]
+            rooms=fetch_rooms(session,cat_key,begin_str,end_str)
+            # 등급 내 방번호 우선순위대로 정렬
+            avail={num_of(r["fcltyCode"]):r for r in rooms}
+            for target_num in nums:
+                if target_num not in avail: continue
+                room=avail[target_num]
+                print(f"    🎯 {begin_str}~{end_str}({nights}박) [{g}] {room['fcltyCode']} 시도")
+                preocpc=preoccupy(session,room,begin_str,end_str)
+                if not preocpc:
+                    print(f"      선점 실패")
+                    continue
+                ok,resp_text,_=submit_reservation(session,user_id,room,preocpc,begin_str,end_str)
+                if ok:
+                    return (nights,room,cat_key,g,end_str)
+                else:
+                    print(f"      거부: {resp_text[:60]}")
+    return None
 
-    if not room:
-        report.append("❌ 3개 카테고리에서 해당 번호 방 못 찾음 (예약가능 상태 아님)")
-        send_telegram("\n".join(report))
-        return
 
-    report.append(f"1️⃣ 방 조회 OK: {room['fcltyCode']} ({CATEGORIES[cat_key]['name']}, ty={room['fcltyTyCode']})")
+def run_plan():
+    now_str=now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now_str} KST] 망상 멀티계정 자동예약 시작")
 
-    # 선점
-    preocpc = preoccupy(room, begin_str, end_str)
-    if not preocpc:
-        report.append(f"2️⃣ ❌ 선점 실패\n응답: <code>{LAST_PREOCPC_RAW}</code>")
-        send_telegram("\n".join(report))
-        return
+    # 계정 유효성
+    for a in ("#1","#2","#3"):
+        if not ACCOUNTS[a]:
+            print(f"  ⚠️ {a} 계정 ID(CK_ID_{a[-1]}) 미설정")
+    if not COMMON_PW:
+        print("  ❌ CK_PW 없음"); return
 
-    report.append(f"2️⃣ ★ 선점 성공! resveNo={preocpc.get('resveNo')}")
-    report.append(f"   선점응답키: {', '.join(preocpc.keys())}")
+    done=load_done()
 
-    # 예약 제출
-    ok, resp_text, payload = submit_reservation(room, preocpc, begin_str, end_str)
-    report.append("")
-    report.append(f"3️⃣ 예약제출 결과: {'✅ 성공' if ok else '❌ 실패/거부'}")
-    report.append(f"📤 보낸값: <code>{json.dumps(payload, ensure_ascii=False)[:350]}</code>")
-    report.append(f"📥 응답: <code>{resp_text}</code>")
+    # 계정별 세션 캐시 (한 실행 내 재로그인 방지)
+    sessions={}
+    def get_session(acct):
+        if acct in sessions: return sessions[acct]
+        uid=ACCOUNTS.get(acct,"")
+        if not uid: return None
+        s=new_session()
+        if login(s,uid):
+            sessions[acct]=s
+            print(f"  ✅ 로그인: {acct}")
+            return s
+        return None
 
-    if ok:
-        report.append("\n🎉 캡차 없이 예약 제출 통과! 무인화 가능!")
+    # 현황 출력
+    for a in ("#1","#2","#3"):
+        print(f"  {a} 회피숙박일: {sorted(booked_set_for(a,done))}")
+
+    success=0
+    # 날짜 순서대로
+    for begin_str in sorted(PLAN.keys()):
+        id_order, grades = PLAN[begin_str]
+        for acct in id_order:
+            uid=ACCOUNTS.get(acct,"")
+            if not uid: continue
+            s=get_session(acct)
+            if not s: continue
+            result=try_one_account_date(s,acct,uid,begin_str,grades,done)
+            if result:
+                nights,room,cat_key,grade,end_str=result
+                key=f"{begin_str}_{nights}박_{acct}_{room['fcltyCode']}"
+                done[key]={"begin":begin_str,"end":end_str,"nights":nights,
+                           "acct":acct,"room":room["fcltyCode"],"grade":grade,
+                           "at":now_str,"ts":now_kst().timestamp()}
+                save_done(done)
+                success+=1
+                msg=("🎉🎉 <b>망상 예약 성공!!</b> 🎉🎉\n\n"
+                     f"📅 {begin_str} ~ {end_str} (<b>{nights}박</b>)\n"
+                     f"🏕️ {CATEGORIES[cat_key]['name']} <b>{room['fcltyCode']}</b> [{grade}]\n"
+                     f"👤 {uid} ({acct})\n"
+                     f"⏰ {now_str} (KST)\n\n"
+                     f"👉 <a href=\"{BASE_URL}/user/mypage/BD_myReservationList.do\">예약 확인</a>")
+                send_telegram(msg)
+                print(f"  ✅✅ 성공! {key}")
+                break  # 이 날짜는 잡았으니 다음 ID 안 봄, 다음 날짜로
+            # 실패면 다음 ID로 스위칭
+
+    if success:
+        print(f"완료! 이번 회차 {success}건 성공")
     else:
-        report.append("\n⚠️ 거부됨 — 응답 내용으로 캡차 필요 여부 판단")
+        print("이번 회차 성공 없음 (재시도 대기)")
 
+
+def run_test():
+    now_str=now_kst().strftime("%Y-%m-%d %H:%M:%S")
+    uid=ACCOUNTS.get(TEST_ACCT,"")
+    print(f"[{now_str} KST] 🧪 테스트: {TEST_ACCT}({uid}) {TEST_DATE} {TEST_ROOM} {TEST_NIGHTS}박")
+    if not uid or not COMMON_PW:
+        send_telegram("🧪 테스트 실패: 계정/PW 없음"); return
+    s=new_session()
+    if not login(s,uid):
+        send_telegram("🧪 테스트 실패: 로그인 안 됨"); return
+    begin_dt=datetime.strptime(TEST_DATE,"%Y-%m-%d").date()
+    end_str=(begin_dt+timedelta(days=TEST_NIGHTS)).strftime("%Y-%m-%d")
+    target=num_of(TEST_ROOM)
+    report=[f"🧪 <b>예약 테스트</b> ⏰ {now_str}",
+            f"📅 {TEST_DATE}~{end_str} / 🏕️ {TEST_ROOM}(숫자={target}) / {TEST_ACCT}({uid})",""]
+    room=None;cat_key=None
+    for ck in CATEGORIES:
+        rooms=fetch_rooms(s,ck,TEST_DATE,end_str)
+        f=next((r for r in rooms if num_of(r["fcltyCode"])==target),None)
+        if f: room=f;cat_key=ck;break
+    if not room:
+        report.append("❌ 해당 번호 방 없음(예약가능 상태 아님)")
+        send_telegram("\n".join(report));return
+    report.append(f"1️⃣ 조회 OK: {room['fcltyCode']} ({CATEGORIES[cat_key]['name']})")
+    preocpc=preoccupy(s,room,TEST_DATE,end_str)
+    if not preocpc:
+        report.append(f"2️⃣ ❌ 선점 실패\n{LAST_PREOCPC_RAW}")
+        send_telegram("\n".join(report));return
+    report.append(f"2️⃣ ★ 선점 성공 resveNo={preocpc.get('resveNo')}")
+    ok,resp_text,payload=submit_reservation(s,uid,room,preocpc,TEST_DATE,end_str)
+    report.append(f"3️⃣ 결과: {'✅ 성공' if ok else '❌ 거부'}")
+    report.append(f"📥 {resp_text}")
     send_telegram("\n".join(report))
-    print("테스트 완료, 텔레그램 전송함")
 
 
 def main():
-    # 테스트 모드 우선
     if TEST_DATE and TEST_ROOM:
         run_test()
-        return
-
-    now_str = now_kst().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now_str} KST] 망상 자동 예약 시작...")
-
-    if not USER_ID or not USER_PW:
-        print("❌ CK_ID / CK_PW 없음")
-        return
-
-    if not login():
-        return
-
-    done = load_done()
-
-    # 이미 예약한 "사용 중인 날짜" 집합 (체크인~체크아웃 전날까지)
-    # done 기록의 각 항목은 begin/nights 정보를 가짐
-    booked_nights = set()  # "2026-07-23" 같은 숙박일(체크인 날)
-    for v in done.values():
-        b = v.get("begin")
-        n = v.get("nights", 1)
-        if b:
-            bd = datetime.strptime(b, "%Y-%m-%d").date()
-            for i in range(n):
-                booked_nights.add((bd + timedelta(days=i)).strftime("%Y-%m-%d"))
-
-    success_count = 0
-
-    # 각 체크인 후보 날짜에 대해 3박→2박→1박 시도
-    for begin_dt, _ in TARGET_DATES:
-        begin_str = begin_dt.strftime("%Y-%m-%d")
-
-        # 이 날짜가 이미 예약된 숙박일이면 건너뜀
-        if begin_str in booked_nights:
-            continue
-
-        # 이미 예약된 날짜를 침범하지 않는 최대 박수 계산 (상한 3박)
-        max_nights = 0
-        for n in range(1, 4):  # 1,2,3박
-            night_day = (begin_dt + timedelta(days=n-1)).strftime("%Y-%m-%d")
-            # n박이면 begin_dt부터 n일간 숙박 → 각 숙박일이 비어있어야 함
-            if night_day in booked_nights:
-                break
-            # 체크아웃일이 8/1 넘어가도 되지만 숙박일 범위만 보면 됨
-            max_nights = n
-
-        if max_nights == 0:
-            continue
-
-        booked_this_date = False
-        # 긴 박수부터 시도
-        for nights in range(max_nights, 0, -1):
-            if booked_this_date:
-                break
-            end_dt2 = begin_dt + timedelta(days=nights)
-            end_str = end_dt2.strftime("%Y-%m-%d")
-
-            for cat_key, cat in CATEGORIES.items():
-                rooms = fetch_rooms(cat_key, begin_str, end_str)
-                targets = [r for r in rooms if is_target_room(cat_key, r["fcltyCode"])]
-                if not targets:
-                    continue
-
-                for room in targets:
-                    print(f"  🎯 타겟: {begin_str}~{end_str}({nights}박) [{cat['name']}] {room['fcltyCode']}")
-
-                    preocpc = preoccupy(room, begin_str, end_str)
-                    if not preocpc:
-                        print(f"    선점 실패 → 다음")
-                        continue
-
-                    ok, resp_text, _payload = submit_reservation(room, preocpc, begin_str, end_str)
-
-                    if ok:
-                        key = f"{begin_str}_{nights}박_{room['fcltyCode']}"
-                        done[key] = {
-                            "begin": begin_str, "end": end_str, "nights": nights,
-                            "room": room["fcltyCode"], "cat": cat["name"], "at": now_str,
-                        }
-                        save_done(done)
-                        # 사용 날짜 추가 (이후 날짜 침범 방지)
-                        for i in range(nights):
-                            booked_nights.add((begin_dt + timedelta(days=i)).strftime("%Y-%m-%d"))
-                        success_count += 1
-                        booked_this_date = True
-                        msg = (
-                            "🎉🎉 <b>망상 예약 성공!!</b> 🎉🎉\n\n"
-                            f"📅 {begin_str} ~ {end_str} (<b>{nights}박</b>)\n"
-                            f"🏕️ {cat['name']} <b>{room['fcltyCode']}</b>\n"
-                            f"👤 {USER_ID}\n"
-                            f"⏰ {now_str} (KST)\n\n"
-                            f"👉 <a href=\"{BASE_URL}/user/mypage/BD_myReservationList.do\">예약 확인</a>"
-                        )
-                        send_telegram(msg)
-                        print(f"  ✅✅ 예약 성공! {key}")
-                        break  # 이 카테고리 방 루프 종료
-                    else:
-                        print(f"    ❌ 거부: {resp_text[:80]}")
-
-                if booked_this_date:
-                    break  # 카테고리 루프 종료
-
-    if success_count:
-        print(f"완료! 이번 회차 {success_count}건 예약 성공")
     else:
-        print("이번 회차 예약 성공 없음 (재시도 대기)")
+        run_plan()
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
