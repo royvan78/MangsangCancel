@@ -14,6 +14,6 @@ jobs:
       - run: pip install requests pycryptodome
       - name: 방 현황 스캔
         env:
-          CK_ID: ${{ secrets.CK_ID }}
-          CK_PW: ${{ secrets.CK_PW }}
+          CK_ID_1: ${{ secrets.CK_ID_1 }}
+          CK_PW:   ${{ secrets.CK_PW }}
         run: python scan.py
