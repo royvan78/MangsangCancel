@@ -4,41 +4,41 @@ on:
   workflow_dispatch:
     inputs:
       test_date:
-        description: "테스트 체크인 날짜 (예: 2026-07-07)"
+        description: "체크인 날짜 (예: 2026-07-07)"
         required: true
         default: "2026-07-07"
       test_room:
-        description: "테스트 방 코드 (예: NF106)"
+        description: "방 코드 (예: NF106 또는 106)"
         required: true
-        default: "NF106"
+        default: "106"
       test_nights:
-        description: "숙박 박수"
+        description: "박수"
         required: true
         default: "1"
+      test_acct:
+        description: "계정 (#1 / #2 / #3)"
+        required: true
+        default: "#1"
 
 jobs:
   test:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 코드 체크아웃
-        uses: actions/checkout@v4
-
-      - name: Python 설정
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: 패키지 설치
-        run: pip install requests pycryptodome
-
-      - name: 예약 테스트 실행
+      - run: pip install requests pycryptodome
+      - name: 테스트 실행
         env:
           TG_TOKEN:    ${{ secrets.TG_TOKEN }}
           TG_CHAT:     ${{ secrets.TG_CHAT }}
-          CK_ID:       ${{ secrets.CK_ID }}
+          CK_ID_1:     ${{ secrets.CK_ID_1 }}
+          CK_ID_2:     ${{ secrets.CK_ID_2 }}
+          CK_ID_3:     ${{ secrets.CK_ID_3 }}
           CK_PW:       ${{ secrets.CK_PW }}
           TEST_DATE:   ${{ github.event.inputs.test_date }}
           TEST_ROOM:   ${{ github.event.inputs.test_room }}
           TEST_NIGHTS: ${{ github.event.inputs.test_nights }}
+          TEST_ACCT:   ${{ github.event.inputs.test_acct }}
         run: python reserve.py
