@@ -256,6 +256,25 @@ def run_plan():
                 return True
         return False
 
+    # 조회 결과 요약 문자열 (모든 가용방 + 타겟표시)
+    def summarize(cat_map, grades):
+        target_nums=set()
+        for g in grades:
+            _,nums=GRADE[g]
+            target_nums.update(nums)
+        parts=[]
+        for ck in ("db","nb","hb"):
+            am=cat_map.get(ck,{})
+            if not am: continue
+            codes=[]
+            for n in sorted(am.keys()):
+                mark="★" if n in target_nums else ""
+                codes.append(f"{mark}{am[n]['fcltyCode']}")
+            parts.append(f"{CATEGORIES[ck]['name']}:{','.join(codes)}")
+        return " / ".join(parts) if parts else "가용없음"
+
+    print("  ── 날짜별 조회 (1박 기준, ★=타겟) ──")
+
     # ── 3. 날짜 순서대로 처리 ──
     for begin_str in sorted(PLAN.keys()):
         id_order,grades=PLAN[begin_str]
@@ -265,7 +284,11 @@ def run_plan():
         # 최적화: 1박 조회해서 이 날짜에 타겟 방이 아예 없으면 건너뜀
         # (1박에 빈방 없으면 2박/3박도 없음)
         base_map=get_avail(begin_str,1)
-        if not has_target_in(base_map,grades):
+        wd="월화수목금토일"[begin_dt.weekday()]
+        summary=summarize(base_map,grades)
+        has_tgt=has_target_in(base_map,grades)
+        print(f"  {begin_str}({wd}) {'🎯' if has_tgt else '  '} {summary}")
+        if not has_tgt:
             continue
 
         for acct in id_order:
