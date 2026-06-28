@@ -258,17 +258,18 @@ def run_plan():
 
     # 조회 결과 요약 문자열 (모든 가용방 + 타겟표시)
     def summarize(cat_map, grades):
-        target_nums=set()
+        # 카테고리별 타겟 방번호 집합 (등급의 카테고리를 정확히 반영)
+        target_by_cat={"db":set(),"nb":set(),"hb":set()}
         for g in grades:
-            _,nums=GRADE[g]
-            target_nums.update(nums)
+            ck,nums=GRADE[g]
+            target_by_cat[ck].update(nums)
         parts=[]
         for ck in ("db","nb","hb"):
             am=cat_map.get(ck,{})
             if not am: continue
             codes=[]
             for n in sorted(am.keys()):
-                mark="★" if n in target_nums else ""
+                mark="★" if n in target_by_cat[ck] else ""
                 codes.append(f"{mark}{am[n]['fcltyCode']}")
             parts.append(f"{CATEGORIES[ck]['name']}:{','.join(codes)}")
         return " / ".join(parts) if parts else "가용없음"
