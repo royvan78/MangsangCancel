@@ -12,19 +12,12 @@ concurrency:
 jobs:
   reserve:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 코드 체크아웃
-        uses: actions/checkout@v4
-
-      - name: Python 설정
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: 패키지 설치
-        run: pip install requests pycryptodome
-
+      - run: pip install requests pycryptodome
       - name: 예약 기록 복원
         uses: actions/cache@v4
         with:
@@ -32,15 +25,15 @@ jobs:
           key: mangsan-reserved-${{ github.run_id }}
           restore-keys: |
             mangsan-reserved-
-
       - name: 자동 예약 실행
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT:  ${{ secrets.TG_CHAT }}
-          CK_ID:    ${{ secrets.CK_ID }}
+          CK_ID_1:  ${{ secrets.CK_ID_1 }}
+          CK_ID_2:  ${{ secrets.CK_ID_2 }}
+          CK_ID_3:  ${{ secrets.CK_ID_3 }}
           CK_PW:    ${{ secrets.CK_PW }}
         run: python reserve.py
-
       - name: 예약 기록 저장
         if: always()
         uses: actions/cache/save@v4
