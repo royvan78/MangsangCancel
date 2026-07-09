@@ -47,23 +47,24 @@ GRADE={
 }
 
 PLAN={
+    "2026-07-21":(["#1"],["난1","든2","허104"]),
     "2026-07-22":(["#1"],["든1","든2","허104"]),
     "2026-07-23":(["#2","#1"],["든1","든2","허104"]),
     "2026-07-24":(["#2"],["든1","든2","허104"]),
-    "2026-07-25":(["#2"],["든1","든2","허104","난105"]),
-    "2026-07-26":(["#2"],["든1","든2","허104","난105"]),
-    "2026-07-27":(["#2","#1"],["든1","든2","든3","난1","난2","허1"]),
-    "2026-07-28":(["#2"],["든1","든2","허104","난105"]),
-    "2026-07-29":(["#2"],["든1","든2","허104","난105"]),
-    "2026-07-30":(["#2"],["든1","든2","허104","난105"]),
-    "2026-07-31":(["#2"],["든1","든2","허104","난105"]),
+    "2026-07-25":(["#3","#2"],["든1","든2","허104","난105"]),
+    "2026-07-26":(["#3","#2"],["든1","든2","허104","난105"]),
+    "2026-07-27":(["#3","#2","#1"],["든1","든2","든3","난1","난2","허1"]),
+    "2026-07-28":(["#3","#2"],["든1","든2","허104","난105"]),
+    "2026-07-29":(["#3","#2"],["든1","든2","허104","난105"]),
+    "2026-07-30":(["#3","#2"],["든1","든2","허104","난105"]),
+    "2026-07-31":(["#3","#2"],["든1","든2","허104","난105"]),
 }
 
 # 계정별 회피숙박일(수동) - 숙박일 기준, 체크아웃 제외
 SKIP_DATES_BY_ACCT={
     "#1":["2026-07-19","2026-07-20","2026-07-21","2026-07-25","2026-07-26","2026-07-28","2026-07-29","2026-07-30"],
     "#2":["2026-07-22"],
-    "#3":["2026-07-23","2026-07-24","2026-07-25","2026-07-26","2026-07-27","2026-07-28"],
+    "#3":["2026-07-23","2026-07-24"],
 }
 
 TG_TOKEN=os.environ.get("TG_TOKEN",""); TG_CHAT=os.environ.get("TG_CHAT","")
@@ -136,7 +137,10 @@ def preoccupy(session,room,begin_de,end_de):
     except Exception as e:
         print(f"      선점 오류: {e}"); return None
     if data.get("preocpcTf") is True: return data
-    LAST_PREOCPC_RAW=json.dumps(data,ensure_ascii=False)[:250]
+    # 실패 사유 핵심 필드 우선 추출
+    msg = data.get("rsltMsg") or data.get("message") or ""
+    key_fields = {k: data.get(k) for k in ("result","preocpcTf","rsltMsg","message","rsltCd","rsltCode") if k in data}
+    LAST_PREOCPC_RAW = f"[핵심] {json.dumps(key_fields, ensure_ascii=False)}\n[전문] " + json.dumps(data, ensure_ascii=False)[:800]
     return None
 
 def submit_reservation(session,user_id,room,preocpc,begin_de,end_de):
@@ -326,7 +330,13 @@ def run_plan():
                         print(f"  🎯 {begin_str}~{end_str}({nights}박)[{g}]{room['fcltyCode']} {acct} 시도")
                         preocpc=preoccupy(s,room,begin_str,end_str)
                         if not preocpc:
-                            print(f"    선점실패: {LAST_PREOCPC_RAW[:50]}")
+                            print(f"    선점실패:\n{LAST_PREOCPC_RAW}")
+                            # 디버그: 첫 선점실패 1건만 텔레그램으로 전문 통보
+                            if not globals().get("_dbg_sent"):
+                                globals()["_dbg_sent"]=True
+                                send_telegram(f"🔍 <b>선점 실패 응답 확인용</b>\n"
+                                    f"{begin_str} {room['fcltyCode']} {acct}\n\n"
+                                    f"<code>{LAST_PREOCPC_RAW[:900]}</code>")
                             continue
                         ok,resp_text=submit_reservation(s,uid,room,preocpc,begin_str,end_str)
                         if ok:
