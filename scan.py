@@ -40,7 +40,7 @@ CATEGORIES = {
 TARGET_ROOMS = {
     "db": ["109","116","103","112","115","119","121","123","120","122"],
     "nb": ["105","108","112","104"],
-    "hb": ["104"],
+    "hb": ["104", "105", "107", "106"],
 }
 
 SESSION = requests.Session()
@@ -54,10 +54,15 @@ def login():
     SESSION.get(f"{BASE_URL}/login/BD_loginForm.do",timeout=10)
     SESSION.headers.update({"Referer":f"{BASE_URL}/login/BD_loginForm.do",
         "X-Requested-With":"XMLHttpRequest","Content-Type":"application/x-www-form-urlencoded; charset=UTF-8","Accept":"*/*"})
-    SESSION.post(f"{BASE_URL}/login/ND_loginAction.do",
+    resp=SESSION.post(f"{BASE_URL}/login/ND_loginAction.do",
         data={"returnUrl":f"{BASE_URL}/index.do","userId":USER_ID,"userPassword":op_encrypt(USER_PW)},
         timeout=15,allow_redirects=True)
-    return "USER_JSESSIONID" in dict(SESSION.cookies)
+    if "USER_JSESSIONID" in dict(SESSION.cookies): return True
+    try:
+        d=resp.json(); val=d.get("value") or {}
+        if d.get("result") is True and (val.get("userId") or d.get("userId")): return True
+    except Exception: pass
+    return False
 
 def scan(cat_key, begin_de, end_de):
     cat=CATEGORIES[cat_key]
