@@ -39,16 +39,19 @@ def op_encrypt(plain_text: str) -> str:
 BASE_URL  = "https://www.campingkorea.or.kr"
 TRRSRT    = "1000"
 
-USER_ID   = os.environ.get("CK_ID", "")
+USER_ID   = os.environ.get("CK_ID_1", "") or os.environ.get("CK_ID", "")
 USER_PW   = os.environ.get("CK_PW", "")  # 평문 비번 → 자동 암호화
 
+# 감시 대상 날짜 (체크인 기준, 1박) — 방 뜨면 알림
+TARGET_DATE_LIST = ["2026-07-25", "2026-07-26", "2026-07-27", "2026-07-29", "2026-07-30"]
 TARGET_DATES = [
-    (date(2026, 7, d), date(2026, 7, d) + timedelta(days=1))
-    for d in range(16, 32)  # 7/16 ~ 7/31 (사용량 절감)
+    (datetime.strptime(d, "%Y-%m-%d").date(),
+     datetime.strptime(d, "%Y-%m-%d").date() + timedelta(days=1))
+    for d in TARGET_DATE_LIST
 ]
 
-# 알림 대상 등급 (이 등급에 해당하는 방만 텔레그램 전송)
-ALERT_RANKS = ("1순위", "2순위")
+# 방 등급 무관: 빈방이면 전부 알림 (성수기 sold out이라 아무 방이나 OK)
+ALERT_ALL_ROOMS = True
 
 CATEGORIES = {
     "db": {"name": "든바다",   "fcltyCode": "1300", "resveNoCode": "MA"},
@@ -115,28 +118,23 @@ def login() -> bool:
     )
 
     # 4. 로그인 성공 여부 확인
-    # 세션 쿠키에 USER_JSESSIONID 있으면 성공
     cookies = dict(SESSION.cookies)
     if "USER_JSESSIONID" in cookies:
         print(f"  ✅ 로그인 성공!")
         return True
 
-    # 응답 body로도 확인
+    # 응답 body로도 확인 (result:true + userId)
     try:
         data = resp.json()
+        val = data.get("value") or {}
+        if data.get("result") is True and (val.get("userId") or data.get("userId")):
+            print(f"  ✅ 로그인 성공! (JSON)")
+            return True
         if data.get("result") == "success" or data.get("loginYn") == "Y":
             print(f"  ✅ 로그인 성공! (JSON)")
             return True
     except Exception:
         pass
-
-    # 리다이렉트 후 index.do 도달 확인
-    if "index.do" in resp.url or resp.status_code == 200:
-        # 한번 더 확인 - 마이페이지 접근 가능한지
-        my = SESSION.get(f"{BASE_URL}/user/mypage/BD_myPage.do", timeout=10)
-        if "로그인" not in my.text[:500]:
-            print(f"  ✅ 로그인 성공! (마이페이지 확인)")
-            return True
 
     print(f"  ❌ 로그인 실패 (status={resp.status_code})")
     print(f"  응답: {resp.text[:200]}")
@@ -248,16 +246,9 @@ def main():
             if not rooms:
                 continue
 
-            # 1순위/2순위 방만 필터링 (3순위/ALL 등은 알림 제외)
-            priority_rooms = [
-                r for r in rooms
-                if get_priority(cat_key, r["fcltyCode"]) in ALERT_RANKS
-            ]
-            if not priority_rooms:
-                continue
-
+            # 방 등급 무관: 모든 빈방을 알림 대상으로 (중복만 제거)
             new_rooms = [
-                r for r in priority_rooms
+                r for r in rooms
                 if not is_already_sent(sent_log, f"{begin_str}_{cat_key}_{r['fcltyCode']}")
             ]
             if new_rooms:
@@ -274,30 +265,24 @@ def main():
         return
 
     # 텔레그램 메시지
-    lines = [f"🏕️ <b>망상 오토캠핑 취소자리 발생!</b>  ⏰ {now_str} (KST)\n"]
-    has_preferred_global = False
+    lines = [f"🏕️ <b>망상 취소자리 발생!</b>  ⏰ {now_str} (KST)\n"]
 
     for date_str, cats in sorted(new_alerts.items()):
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append(f"📅 <b>{date_str}</b>")
         for cat_key, rooms in cats.items():
             parts = []
-            has_preferred = False
             for r in rooms:
                 code = r["fcltyCode"]
                 rank = get_priority(cat_key, code)
                 if rank:
-                    parts.append(f"<b>{code}[{rank}]⭐</b>")
-                    has_preferred = True
-                    has_preferred_global = True
+                    parts.append(f"<b>{code}⭐</b>")  # 선호방이면 ⭐
                 else:
                     parts.append(code)
-            prefix = "★ " if has_preferred else "  "
-            lines.append(f"{prefix}[{CATEGORIES[cat_key]['name']}] {', '.join(parts)}")
+            lines.append(f"  [{CATEGORIES[cat_key]['name']}] {', '.join(parts)}")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
-    if has_preferred_global:
-        lines.append("⚡ <b>선호 방 포함! 지금 바로 예약하세요!</b>")
+    lines.append("⚡ <b>브라우저(v5.15)로 지금 예약하세요!</b>")
     lines.append(f'👉 <a href="{BASE_URL}/user/reservation/BD_reservation.do">예약 페이지</a>')
 
     send_telegram("\n".join(lines))
