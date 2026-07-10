@@ -47,9 +47,8 @@ GRADE={
 }
 
 PLAN={
-    "2026-07-21":(["#1"],["난1","든3","허104"]),
     "2026-07-22":(["#1"],["든1","든2","허104"]),
-    "2026-07-23":(["#2","#1"],["든1","든2","허104","허1"]),
+    "2026-07-23":(["#2","#1"],["든1","든2","허104"]),
     "2026-07-24":(["#2"],["든1","든2","허104"]),
     "2026-07-25":(["#3","#2"],["든1","든2","허104","난105"]),
     "2026-07-26":(["#3","#2"],["든1","든2","허104","난105"]),
@@ -62,7 +61,7 @@ PLAN={
 
 # 계정별 회피숙박일(수동) - 숙박일 기준, 체크아웃 제외
 SKIP_DATES_BY_ACCT={
-    "#1":["2026-07-25","2026-07-26","2026-07-28","2026-07-29","2026-07-30"],
+    "#1":["2026-07-19","2026-07-20","2026-07-21","2026-07-25","2026-07-26","2026-07-28","2026-07-29","2026-07-30"],
     "#2":["2026-07-22"],
     "#3":["2026-07-23","2026-07-24"],
 }
@@ -124,23 +123,68 @@ def fetch_rooms(session,cat_key,begin_de,end_de):
             out.append({"fcltyCode":f["fcltyCode"],"fcltyTyCode":f.get("fcltyTyCode",""),"resveNoCode":cat["resveNoCode"]})
     return out
 
+def issue_pass(session, which):
+    """ND_newPassResvN.do 호출 → 패스권 key 반환 (실패시 '')
+    which: '1' 또는 '2'"""
+    url=f"{BASE_URL}/user/reservation/ND_newPassResv{which}.do"
+    session.headers.update({"Referer":f"{BASE_URL}/user/reservation/BD_reservation.do",
+        "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With":"XMLHttpRequest","Accept":"*/*"})
+    try:
+        resp=session.post(url,data="",timeout=10)
+        text=resp.text.strip()
+    except Exception as e:
+        print(f"      패스권{which} 발급 오류: {e}"); return ""
+    # 응답 형식 "PASS:RESV1|값"
+    m=re.search(rf"PASS:RESV{which}\|(.+)", text)
+    if m:
+        return m.group(1).strip()
+    print(f"      패스권{which} 발급 실패: {text[:100]}")
+    return ""
+
+
+def get_passes(session):
+    """RESV1, RESV2 발급받아 (p1, p2, nftime) 반환.
+    passNfTime은 쿠키 NetFunnel_ID 등에서 유추, 없으면 현재ms."""
+    p1=issue_pass(session,"1")
+    p2=issue_pass(session,"2")
+    # passNfTime: 히스토리상 dhscamp_pass_netfunnelt(넷퍼넬 시각).
+    # 브라우저 sessionStorage 값이라 서버세션엔 없음. 쿠키/현재시각으로 시도.
+    nftime=""
+    ck=dict(session.cookies)
+    nf=ck.get("NetFunnel_ID","")
+    if nf:
+        nftime=nf
+    if not nftime:
+        nftime=str(int(now_kst().timestamp()*1000))
+    return p1,p2,nftime
+
+
 def preoccupy(session,room,begin_de,end_de):
     global LAST_PREOCPC_RAW
     session.headers.update({"Referer":f"{BASE_URL}/user/reservation/BD_reservationReq.do",
         "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
         "Accept":"application/json, text/javascript, */*; q=0.01","X-Requested-With":"XMLHttpRequest"})
+    # 패스권 발급해서 첨부
+    p1,p2,nftime=get_passes(session)
+    body={"trrsrtCode":TRRSRT,"fcltyCode":room["fcltyCode"],"resveNoCode":room["resveNoCode"],
+          "resveBeginDe":begin_de,"resveEndDe":end_de,
+          "passResv1":p1,"passResv2":p2,"passNfTime":nftime}
     try:
-        resp=session.post(f"{BASE_URL}/user/reservation/ND_insertPreocpc.do",
-            data={"trrsrtCode":TRRSRT,"fcltyCode":room["fcltyCode"],"resveNoCode":room["resveNoCode"],
-                  "resveBeginDe":begin_de,"resveEndDe":end_de},timeout=10)
+        resp=session.post(f"{BASE_URL}/user/reservation/ND_insertPreocpc.do",data=body,timeout=10)
         data=resp.json()
     except Exception as e:
         print(f"      선점 오류: {e}"); return None
-    if data.get("preocpcTf") is True: return data
+    if data.get("preocpcTf") is True:
+        # 예약제출에서 재사용하도록 패스권 실어보냄
+        data["_passResv1"]=p1; data["_passResv2"]=p2; data["_passNfTime"]=nftime
+        return data
     # 실패 사유 핵심 필드 우선 추출
     msg = data.get("rsltMsg") or data.get("message") or ""
     key_fields = {k: data.get(k) for k in ("result","preocpcTf","rsltMsg","message","rsltCd","rsltCode") if k in data}
-    LAST_PREOCPC_RAW = f"[핵심] {json.dumps(key_fields, ensure_ascii=False)}\n[전문] " + json.dumps(data, ensure_ascii=False)[:800]
+    LAST_PREOCPC_RAW = (f"[패스권] R1={p1[:12] or '없음'} R2={p2[:12] or '없음'} nf={nftime[:16]}\n"
+                        f"[핵심] {json.dumps(key_fields, ensure_ascii=False)}\n"
+                        f"[전문] " + json.dumps(data, ensure_ascii=False)[:600])
     return None
 
 def submit_reservation(session,user_id,room,preocpc,begin_de,end_de):
@@ -156,6 +200,10 @@ def submit_reservation(session,user_id,room,preocpc,begin_de,end_de):
         "resveBeginDe":begin_de,"resveEndDe":end_de,"resveNo":pick("resveNo",""),
         "registerId":user_id,"encptEmgncCttpc":EMGNC_CTTPC,"rsvctmArea":RSVCTM_AREA,"dspsnFcltyUseAt":"N"}
     if preocpc.get("entrceDelayCode"): payload["entrceDelayCode"]=preocpc["entrceDelayCode"]
+    # 패스권 3개 첨부 (선점 때 발급분 재사용)
+    if preocpc.get("_passResv1"): payload["passResv1"]=preocpc["_passResv1"]
+    if preocpc.get("_passResv2"): payload["passResv2"]=preocpc["_passResv2"]
+    if preocpc.get("_passNfTime"): payload["passNfTime"]=preocpc["_passNfTime"]
     try:
         resp=session.post(f"{BASE_URL}/user/reservation/ND_insertresve.do",data=payload,timeout=15)
         text=resp.text.strip()
